@@ -64,28 +64,38 @@ The indexer engine polls the chain at a configurable interval:
 
 Each handler has its own independent cursor. If handler B fails, handler A's progress is unaffected.
 
-## Implement Your Handler
+## Configure Contracts
 
-Edit `internal/handler/handler.go`:
+Contract addresses and events are defined in config, not in code:
+
+```yaml
+contracts:
+  - name: "transfer-watcher"
+    address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+    events:
+      - "Transfer(address,address,uint256)"
+
+  - name: "approval-watcher"
+    address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+    events:
+      - "Approval(address,address,uint256)"
+```
+
+Each entry becomes an independent handler with its own cursor. Event signatures are automatically hashed to topic0.
+
+## Add Business Logic
+
+Edit `internal/handler/handler.go` → `HandleLogs()`:
 
 ```go
-func (h *MyHandler) Name() string { return "my-handler" }
-
-func (h *MyHandler) Filter() indexer.EventFilter {
-    return indexer.EventFilter{
-        Addresses: []common.Address{common.HexToAddress("0x...")},
-        Topics:    [][]common.Hash{{crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))}},
+func (h *ContractHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
+    for _, lg := range logs {
+        // Your business logic here.
+        // MUST be idempotent — the engine provides at-least-once delivery.
     }
-}
-
-func (h *MyHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
-    // Your business logic here.
-    // MUST be idempotent — the engine provides at-least-once delivery.
     return nil
 }
 ```
-
-**Important**: `Filter()` must return at least one address or topic. Empty filters are rejected at startup.
 
 ## Configuration
 

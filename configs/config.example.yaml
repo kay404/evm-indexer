@@ -19,3 +19,9 @@ indexer:
   delay_block: 3
   log_scan_batch_blocks: 500
   start_block: 0
+
+contracts:
+  - name: "my-handler"
+    address: "0x0000000000000000000000000000000000000001"
+    events:
+      - "Transfer(address,address,uint256)"

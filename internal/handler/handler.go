@@ -1,42 +1,83 @@
 // Package handler contains the EventHandler implementation.
-// TODO: replace the example LogHandler with your actual business logic.
+// TODO: add your actual business logic in HandleLogs.
 package handler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/kay404/evm-indexer/internal/indexer"
 )
 
-// LogHandler is a minimal example handler that logs every event it receives.
-// Replace this with your actual business logic.
-type LogHandler struct {
+// ContractConfig holds the configuration for a single contract handler.
+type ContractConfig struct {
+	Name    string   `yaml:"name"`
+	Address string   `yaml:"address"`
+	Events  []string `yaml:"events"`
+}
+
+// Validate checks that required fields are set.
+func (c ContractConfig) Validate() error {
+	if c.Name == "" {
+		return fmt.Errorf("contract: name is required")
+	}
+	if c.Address == "" {
+		return fmt.Errorf("contract %q: address is required", c.Name)
+	}
+	if len(c.Events) == 0 {
+		return fmt.Errorf("contract %q: at least one event is required", c.Name)
+	}
+	return nil
+}
+
+// ContractHandler monitors a single contract's events based on configuration.
+type ContractHandler struct {
+	cfg    ContractConfig
 	Logger *slog.Logger
 }
 
-func (h *LogHandler) Name() string { return "log-handler" }
+// NewContractHandler creates a handler from config.
+func NewContractHandler(cfg ContractConfig, logger *slog.Logger) (*ContractHandler, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &ContractHandler{cfg: cfg, Logger: logger}, nil
+}
 
-func (h *LogHandler) Filter() indexer.EventFilter {
-	// TODO: replace with your actual contract addresses and event topics.
-	// Returning an empty filter causes indexer.New() to return a clear error:
-	//   "handler "log-handler" has empty filter ..."
-	return indexer.EventFilter{}
+func (h *ContractHandler) Name() string { return h.cfg.Name }
+
+func (h *ContractHandler) Filter() indexer.EventFilter {
+	addr := common.HexToAddress(h.cfg.Address)
+
+	var topics []common.Hash
+	for _, event := range h.cfg.Events {
+		topics = append(topics, crypto.Keccak256Hash([]byte(event)))
+	}
+
+	return indexer.EventFilter{
+		Addresses: []common.Address{addr},
+		Topics:    [][]common.Hash{topics},
+	}
 }
 
 // HandleLogs processes a batch of matched logs.
 // This method MUST be idempotent — the engine provides at-least-once delivery.
 // Use unique constraints, upserts, or deduplication by (txHash, logIndex).
-func (h *LogHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
+func (h *ContractHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
 	for _, lg := range logs {
 		h.Logger.Info("event",
+			"handler", h.cfg.Name,
 			"address", lg.Address.Hex(),
 			"tx", lg.TxHash.Hex(),
 			"block", lg.BlockNumber,
 			"log_index", lg.Index,
 		)
 	}
+	// TODO: add your business logic here.
 	return nil
 }

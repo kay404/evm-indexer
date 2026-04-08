@@ -20,7 +20,8 @@ type AppConfig struct {
 			Default config.PostgresConfig `yaml:"default"`
 		} `yaml:"postgres"`
 	} `yaml:"databases"`
-	Indexer indexer.Config `yaml:"indexer"`
+	Indexer   indexer.Config           `yaml:"indexer"`
+	Contracts []handler.ContractConfig `yaml:"contracts"`
 }
 
 func main() {
@@ -35,11 +36,15 @@ func main() {
 	}
 
 	// Environment variables override config file values.
-	// e.g. INDEXER_RPC_URL, INDEXER_CHAIN_ID, INDEXER_POSTGRES_HOST, etc.
 	cfg.Indexer.ApplyEnv("INDEXER")
 	cfg.Databases.Postgres.Default.ApplyEnv("INDEXER")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	if len(cfg.Contracts) == 0 {
+		logger.Error("no contracts configured — add at least one entry to 'contracts' in config")
+		os.Exit(1)
+	}
 
 	db, err := postgres.NewDB(cfg.Databases.Postgres.Default)
 	if err != nil {
@@ -49,15 +54,22 @@ func main() {
 
 	cursor := indexer.NewPostgresCursorStore(db)
 
-	// Register handler(s) — edit internal/handler/ to add your business logic.
-	h := &handler.LogHandler{Logger: logger}
+	// Build handlers from config.
+	var handlers []indexer.EventHandler
+	for _, cc := range cfg.Contracts {
+		h, err := handler.NewContractHandler(cc, logger)
+		if err != nil {
+			logger.Error("invalid contract config", "error", err)
+			os.Exit(1)
+		}
+		handlers = append(handlers, h)
+	}
 
-	engine, err := indexer.New(cfg.Indexer, cursor, logger, h)
+	engine, err := indexer.New(cfg.Indexer, cursor, logger, handlers...)
 	if err != nil {
 		logger.Error("create indexer failed", "error", err)
 		os.Exit(1)
 	}
-	// Register DB for graceful close on shutdown.
 	if sqlDB, err := db.DB(); err == nil {
 		engine.AddCloser(sqlDB)
 	}
@@ -66,7 +78,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("indexer started", "rpc", cfg.Indexer.RPCURL, "chain_id", cfg.Indexer.ChainID)
+	logger.Info("indexer started",
+		"rpc", cfg.Indexer.RPCURL,
+		"chain_id", cfg.Indexer.ChainID,
+		"handlers", len(handlers),
+	)
 	if err := engine.Run(ctx); err != nil && err != context.Canceled {
 		logger.Error("indexer stopped with error", "error", err)
 		os.Exit(1)
