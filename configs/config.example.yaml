@@ -1,0 +1,21 @@
+databases:
+  postgres:
+    default:
+      host: "127.0.0.1"
+      port: 5432
+      dbname: "indexer"
+      username: "postgres"
+      password: "postgres"
+      sslmode: "disable"
+      showSql: false
+      maxOpenConns: 20
+      maxIdleConns: 10
+      connMaxLifetime: 10m
+
+indexer:
+  rpc_url: "https://bsc-dataseed.binance.org"
+  chain_id: 56
+  poll_interval: 3s
+  delay_block: 3
+  log_scan_batch_blocks: 500
+  start_block: 0
