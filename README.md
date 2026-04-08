@@ -1,32 +1,44 @@
 # evm-indexer
 
-A Go template for building EVM chain event indexers. Clone, customize your handler, and start monitoring on-chain contract events.
+A Go project template for building EVM chain event indexers. Clone this repo, customize your handler, and start monitoring on-chain contract events.
 
 ## Quick Start
 
 ```bash
-# 1. Clone
+# 1. Clone and detach from template
 git clone https://github.com/kay404/evm-indexer.git my-oracle
 cd my-oracle
+rm -rf .git
 
-# 2. Edit handler
+# 2. Set your module path
+#    Replace ALL occurrences of "github.com/kay404/evm-indexer" in go.mod and *.go files
+#    with your own module path, e.g. "github.com/yourname/my-oracle"
+find . -name "*.go" -o -name "go.mod" | xargs sed -i '' 's|github.com/kay404/evm-indexer|github.com/yourname/my-oracle|g'
+
+# 3. Rename entry point
+mv cmd/indexer cmd/my-oracle
+
+# 4. Edit handler
 #    internal/handler/handler.go → Fill in Filter() and HandleLogs()
 
-# 3. Edit config
-#    configs/config.example.yaml → Set rpc_url, chain_id, postgres
+# 5. Copy and edit config
+cp configs/config.example.yaml configs/config.yaml
+#    → Set rpc_url, chain_id, postgres connection
 
-# 4. Run migrations
+# 6. Install goose and run migrations
+go install github.com/pressly/goose/v3/cmd/goose@latest
 make migrate-up DB_DSN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
 
-# 5. Run
-make indexer CONFIG=configs/config.example.yaml
+# 7. Resolve dependencies and run
+go mod tidy
+make run
 ```
 
 ## Project Structure
 
 ```
 ├── cmd/
-│   ├── indexer/main.go          # Entry point
+│   ├── indexer/main.go          # Entry point (rename to your project)
 │   └── dbgen/main.go            # GORM code generation tool
 ├── internal/
 │   ├── config/                  # Config types, YAML loader, env helpers
@@ -73,11 +85,13 @@ func (h *MyHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
 }
 ```
 
+**Important**: `Filter()` must return at least one address or topic. Empty filters are rejected at startup.
+
 ## Configuration
 
 ### YAML
 
-See `configs/config.example.yaml` for all available options.
+Copy `configs/config.example.yaml` to `configs/config.yaml` and fill in your values.
 
 ### Environment Variables
 
@@ -109,9 +123,10 @@ Environment variables override YAML values. Prefix: `INDEXER_`.
 | `make test` | Run tests |
 | `make clean` | Remove build artifacts |
 
-## Key Design Decisions
+## Design Decisions
 
 - **At-least-once delivery**: handlers may receive the same logs on retry. Implement idempotency using unique constraints or deduplication by `(txHash, logIndex)`.
 - **Reorg strategy**: relies on `delay_block` to avoid short-lived reorgs. No block hash verification. If your business is reorg-sensitive, add your own checks.
 - **Per-handler cursors**: each handler tracks its own progress independently via the `scan_cursor` table.
 - **Fail fast**: empty filters, missing config fields, and invalid chain IDs are rejected at startup.
+- **Config validation**: `postgres.NewDB()` applies defaults then validates; `indexer.New()` validates config and handler filters before connecting to RPC.
