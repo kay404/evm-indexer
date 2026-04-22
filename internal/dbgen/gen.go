@@ -11,7 +11,7 @@ import (
 // Config controls code generation behavior.
 type Config struct {
 	// OutPath is the output directory for generated query code.
-	// Example: "internal/db/postgres/query"
+	// Example: "internal/db/query"
 	OutPath string
 
 	// ModelPkgPath is the package name for generated models, relative to OutPath.

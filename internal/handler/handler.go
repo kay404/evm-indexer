@@ -29,6 +29,9 @@ func (c ContractConfig) Validate() error {
 	if c.Address == "" {
 		return fmt.Errorf("contract %q: address is required", c.Name)
 	}
+	if !common.IsHexAddress(c.Address) {
+		return fmt.Errorf("contract %q: address %q is not a valid hex address", c.Name, c.Address)
+	}
 	if len(c.Events) == 0 {
 		return fmt.Errorf("contract %q: at least one event is required", c.Name)
 	}
@@ -38,7 +41,8 @@ func (c ContractConfig) Validate() error {
 // ContractHandler monitors a single contract's events based on configuration.
 type ContractHandler struct {
 	cfg    ContractConfig
-	Logger *slog.Logger
+	logger *slog.Logger
+	filter indexer.EventFilter
 }
 
 // NewContractHandler creates a handler from config.
@@ -46,31 +50,32 @@ func NewContractHandler(cfg ContractConfig, logger *slog.Logger) (*ContractHandl
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &ContractHandler{cfg: cfg, Logger: logger}, nil
+
+	topics := make([]common.Hash, len(cfg.Events))
+	for i, event := range cfg.Events {
+		topics[i] = crypto.Keccak256Hash([]byte(event))
+	}
+
+	return &ContractHandler{
+		cfg:    cfg,
+		logger: logger,
+		filter: indexer.EventFilter{
+			Addresses: []common.Address{common.HexToAddress(cfg.Address)},
+			Topics:    [][]common.Hash{topics},
+		},
+	}, nil
 }
 
 func (h *ContractHandler) Name() string { return h.cfg.Name }
 
-func (h *ContractHandler) Filter() indexer.EventFilter {
-	addr := common.HexToAddress(h.cfg.Address)
-
-	var topics []common.Hash
-	for _, event := range h.cfg.Events {
-		topics = append(topics, crypto.Keccak256Hash([]byte(event)))
-	}
-
-	return indexer.EventFilter{
-		Addresses: []common.Address{addr},
-		Topics:    [][]common.Hash{topics},
-	}
-}
+func (h *ContractHandler) Filter() indexer.EventFilter { return h.filter }
 
 // HandleLogs processes a batch of matched logs.
 // This method MUST be idempotent — the engine provides at-least-once delivery.
 // Use unique constraints, upserts, or deduplication by (txHash, logIndex).
 func (h *ContractHandler) HandleLogs(ctx context.Context, logs []types.Log) error {
 	for _, lg := range logs {
-		h.Logger.Info("event",
+		h.logger.Info("event",
 			"handler", h.cfg.Name,
 			"address", lg.Address.Hex(),
 			"tx", lg.TxHash.Hex(),

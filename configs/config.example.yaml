@@ -1,4 +1,6 @@
 databases:
+  driver: "postgres"  # "postgres" or "mysql"
+
   postgres:
     default:
       host: "127.0.0.1"
@@ -11,6 +13,19 @@ databases:
       maxOpenConns: 20
       maxIdleConns: 10
       connMaxLifetime: 10m
+
+  # mysql:
+  #   default:
+  #     host: "127.0.0.1"
+  #     port: 3306
+  #     dbname: "indexer"
+  #     username: "root"
+  #     password: "root"
+  #     charset: "utf8mb4"
+  #     showSql: false
+  #     maxOpenConns: 20
+  #     maxIdleConns: 10
+  #     connMaxLifetime: 10m
 
 indexer:
   rpc_url: "https://bsc-dataseed.binance.org"

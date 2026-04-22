@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,14 +13,21 @@ import (
 	"github.com/kay404/evm-indexer/internal/config"
 	"github.com/kay404/evm-indexer/internal/handler"
 	"github.com/kay404/evm-indexer/internal/indexer"
+	"github.com/kay404/evm-indexer/internal/mysql"
 	"github.com/kay404/evm-indexer/internal/postgres"
+
+	"gorm.io/gorm"
 )
 
 type AppConfig struct {
 	Databases struct {
+		Driver   string `yaml:"driver"`
 		Postgres struct {
 			Default config.PostgresConfig `yaml:"default"`
 		} `yaml:"postgres"`
+		MySQL struct {
+			Default config.MySQLConfig `yaml:"default"`
+		} `yaml:"mysql"`
 	} `yaml:"databases"`
 	Indexer   indexer.Config           `yaml:"indexer"`
 	Contracts []handler.ContractConfig `yaml:"contracts"`
@@ -26,7 +35,7 @@ type AppConfig struct {
 
 func main() {
 	var configPath string
-	flag.StringVar(&configPath, "config", "configs/config.example.yaml", "path to yaml config file")
+	flag.StringVar(&configPath, "config", "configs/config.yaml", "path to yaml config file")
 	flag.Parse()
 
 	var cfg AppConfig
@@ -37,7 +46,14 @@ func main() {
 
 	// Environment variables override config file values.
 	cfg.Indexer.ApplyEnv("INDEXER")
+	config.SetString(&cfg.Databases.Driver, "INDEXER_DB_DRIVER")
 	cfg.Databases.Postgres.Default.ApplyEnv("INDEXER")
+	cfg.Databases.MySQL.Default.ApplyEnv("INDEXER")
+
+	// Default driver to postgres for backward compatibility.
+	if cfg.Databases.Driver == "" {
+		cfg.Databases.Driver = "postgres"
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -46,13 +62,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := postgres.NewDB(cfg.Databases.Postgres.Default)
+	db, err := openDB(cfg)
 	if err != nil {
-		logger.Error("connect database failed", "error", err)
+		logger.Error("connect database failed", "driver", cfg.Databases.Driver, "error", err)
 		os.Exit(1)
 	}
 
-	cursor := indexer.NewPostgresCursorStore(db)
+	cursor := indexer.NewGormCursorStore(db)
 
 	// Build handlers from config.
 	var handlers []indexer.EventHandler
@@ -81,11 +97,23 @@ func main() {
 	logger.Info("indexer started",
 		"rpc", cfg.Indexer.RPCURL,
 		"chain_id", cfg.Indexer.ChainID,
+		"db_driver", cfg.Databases.Driver,
 		"handlers", len(handlers),
 	)
-	if err := engine.Run(ctx); err != nil && err != context.Canceled {
+	if err := engine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("indexer stopped with error", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("indexer stopped")
+}
+
+func openDB(cfg AppConfig) (*gorm.DB, error) {
+	switch cfg.Databases.Driver {
+	case "postgres":
+		return postgres.NewDB(cfg.Databases.Postgres.Default)
+	case "mysql":
+		return mysql.NewDB(cfg.Databases.MySQL.Default)
+	default:
+		return nil, fmt.Errorf("unsupported database driver: %q (supported: postgres, mysql)", cfg.Databases.Driver)
+	}
 }

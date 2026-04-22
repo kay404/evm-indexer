@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -267,6 +268,77 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 	_, err := New(Config{}, newMemoryCursorStore(), testLogger(), h)
 	if err == nil {
 		t.Error("expected error for invalid config")
+	}
+}
+
+// Nil logger must not panic — engine substitutes a discard logger.
+func TestNew_AcceptsNilLogger(t *testing.T) {
+	cfg := Config{RPCURL: "http://localhost:8545", ChainID: 1}
+	h := &mockHandler{name: "test", filter: validFilter()}
+	eng, err := New(cfg, newMemoryCursorStore(), nil, h)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if eng.logger == nil {
+		t.Error("expected non-nil fallback logger")
+	}
+}
+
+// --- error classifier tests ---
+
+func TestIsResultTooLargeErr(t *testing.T) {
+	trueCases := []string{
+		"query returned more than 10000 results",
+		"Log response size exceeded",
+		"too many results in eth_getLogs",
+		"block range is too large",
+		"query timeout of 10 seconds exceeded",
+	}
+	for _, msg := range trueCases {
+		if !isResultTooLargeErr(errors.New(msg)) {
+			t.Errorf("expected too-large=true for %q", msg)
+		}
+	}
+	// These are rate-limit / transient errors that must NOT be caught as too-large.
+	falseCases := []string{
+		"HTTP 429 Too Many Requests",
+		"rate limit exceeded for method",
+		"connection refused",
+	}
+	for _, msg := range falseCases {
+		if isResultTooLargeErr(errors.New(msg)) {
+			t.Errorf("expected too-large=false for %q", msg)
+		}
+	}
+	if isResultTooLargeErr(nil) {
+		t.Error("nil err should not be too-large")
+	}
+}
+
+func TestIsTransientErr(t *testing.T) {
+	trueCases := []string{
+		"HTTP 429 Too Many Requests",
+		"rate limit exceeded for method",
+		"connection reset by peer",
+		"i/o timeout",
+		"context deadline exceeded",
+		"EOF",
+		"service temporarily unavailable",
+	}
+	for _, msg := range trueCases {
+		if !isTransientErr(errors.New(msg)) {
+			t.Errorf("expected transient=true for %q", msg)
+		}
+	}
+	if isTransientErr(nil) {
+		t.Error("nil err should not be transient")
+	}
+	if isTransientErr(errors.New("invalid JSON response")) {
+		t.Error("unrelated error should not be transient")
+	}
+	// Too-large errors must not also be classified transient (caller handles them differently).
+	if isTransientErr(errors.New("query returned more than 10000 results")) {
+		t.Error("too-large error should not be transient")
 	}
 }
 

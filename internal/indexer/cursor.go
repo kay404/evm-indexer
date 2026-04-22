@@ -28,17 +28,17 @@ type scanCursor struct {
 
 func (scanCursor) TableName() string { return "scan_cursor" }
 
-// PostgresCursorStore is the default CursorStore backed by PostgreSQL.
-type PostgresCursorStore struct {
+// GormCursorStore is the default CursorStore backed by any GORM-supported database.
+type GormCursorStore struct {
 	db *gorm.DB
 }
 
-// NewPostgresCursorStore creates a cursor store using the given GORM database.
-func NewPostgresCursorStore(db *gorm.DB) *PostgresCursorStore {
-	return &PostgresCursorStore{db: db}
+// NewGormCursorStore creates a cursor store using the given GORM database.
+func NewGormCursorStore(db *gorm.DB) *GormCursorStore {
+	return &GormCursorStore{db: db}
 }
 
-func (s *PostgresCursorStore) GetCursor(ctx context.Context, name string) (uint64, bool, error) {
+func (s *GormCursorStore) GetCursor(ctx context.Context, name string) (uint64, bool, error) {
 	var rec scanCursor
 	err := s.db.WithContext(ctx).Where("name = ?", name).First(&rec).Error
 	if err != nil {
@@ -50,7 +50,7 @@ func (s *PostgresCursorStore) GetCursor(ctx context.Context, name string) (uint6
 	return uint64(rec.LastSafeBlockProcessed), true, nil
 }
 
-func (s *PostgresCursorStore) UpsertCursor(ctx context.Context, name string, block uint64) error {
+func (s *GormCursorStore) UpsertCursor(ctx context.Context, name string, block uint64) error {
 	now := time.Now().UTC()
 	rec := &scanCursor{
 		Name:                   name,

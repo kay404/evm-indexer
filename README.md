@@ -23,15 +23,19 @@ mv cmd/indexer cmd/my-oracle
 
 # 5. Copy and edit config
 cp configs/config.example.yaml configs/config.yaml
-#    → Set rpc_url, chain_id, postgres connection
+#    → Set rpc_url, chain_id, database connection
+#    → Set databases.driver to "postgres" (default) or "mysql"
 
 # 6. Install goose and run migrations
 go install github.com/pressly/goose/v3/cmd/goose@latest
+# PostgreSQL:
 make migrate-up DB_DSN="postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+# MySQL:
+# make migrate-mysql-up DB_DSN="user:pass@tcp(localhost:3306)/mydb?parseTime=true"
 
 # 7. Resolve dependencies and run
 go mod tidy
-make run
+make indexer
 ```
 
 ## Project Structure
@@ -42,14 +46,21 @@ make run
 │   └── dbgen/main.go            # GORM code generation tool
 ├── internal/
 │   ├── config/                  # Config types, YAML loader, env helpers
-│   ├── postgres/                # DB connection with Option pattern
+│   ├── postgres/                # PostgreSQL connection with Option pattern
+│   ├── mysql/                   # MySQL connection with Option pattern
 │   ├── indexer/                 # Engine, handler interface, cursor
 │   ├── dbgen/                   # GORM Gen wrapper
 │   └── handler/                 # Your EventHandler implementation
 ├── configs/
 │   └── config.example.yaml
 ├── migrations/
-│   └── 000001_init_indexer.sql
+│   ├── postgres/                # PostgreSQL migrations
+│   └── mysql/                   # MySQL migrations
+├── tests/
+│   └── integration/             # Integration tests (separate Go module, requires Docker)
+├── Dockerfile                   # Multi-stage build for the indexer binary
+├── docker-compose.yml           # Compose stack with postgres/mysql profiles
+├── .dockerignore
 └── Makefile
 ```
 
@@ -107,6 +118,8 @@ Copy `configs/config.example.yaml` to `configs/config.yaml` and fill in your val
 
 Environment variables override YAML values. Prefix: `INDEXER_`.
 
+**Indexer:**
+
 | Variable | Description |
 |----------|-------------|
 | `INDEXER_RPC_URL` | Chain RPC endpoint |
@@ -114,11 +127,68 @@ Environment variables override YAML values. Prefix: `INDEXER_`.
 | `INDEXER_POLL_INTERVAL` | Poll interval (e.g. `3s`) |
 | `INDEXER_DELAY_BLOCK` | Safe block delay |
 | `INDEXER_START_BLOCK` | Block to start scanning from |
+
+**Database driver:**
+
+| Variable | Description |
+|----------|-------------|
+| `INDEXER_DB_DRIVER` | `postgres` (default) or `mysql` |
+
+**PostgreSQL** (`databases.driver: "postgres"`):
+
+| Variable | Description |
+|----------|-------------|
 | `INDEXER_POSTGRES_HOST` | Postgres host |
 | `INDEXER_POSTGRES_PORT` | Postgres port |
 | `INDEXER_POSTGRES_DBNAME` | Database name |
 | `INDEXER_POSTGRES_USERNAME` | Database user |
 | `INDEXER_POSTGRES_PASSWORD` | Database password |
+
+**MySQL** (`databases.driver: "mysql"`):
+
+| Variable | Description |
+|----------|-------------|
+| `INDEXER_MYSQL_HOST` | MySQL host |
+| `INDEXER_MYSQL_PORT` | MySQL port |
+| `INDEXER_MYSQL_DBNAME` | Database name |
+| `INDEXER_MYSQL_USERNAME` | Database user |
+| `INDEXER_MYSQL_PASSWORD` | Database password |
+| `INDEXER_MYSQL_CHARSET` | Charset (default: `utf8mb4`) |
+| `INDEXER_MYSQL_LOC` | Timezone (default: `UTC`, e.g. `Asia/Shanghai`) |
+
+## Docker
+
+The repo ships with a multi-stage `Dockerfile` and a `docker-compose.yml` that bundles the indexer together with either PostgreSQL or MySQL via Compose profiles.
+
+```bash
+# 1. Build the image
+make docker-build
+
+# 2. Make sure configs/config.yaml exists and the database host points at the
+#    compose service name (`postgres` or `mysql`), not 127.0.0.1.
+
+# 3. Bring up one stack (choose ONE profile)
+make docker-up-postgres
+# or
+make docker-up-mysql
+
+# 4. Run migrations against the containerised DB
+#    PostgreSQL:
+make migrate-up    DB_DSN="postgres://postgres:postgres@localhost:5432/indexer?sslmode=disable"
+#    MySQL:
+make migrate-mysql-up DB_DSN="indexer:indexer@tcp(localhost:3306)/indexer?parseTime=true"
+
+# 5. Tail logs / stop the stack
+make docker-logs
+make docker-down
+```
+
+Notes:
+
+- The image runs as a non-root user and only contains the indexer binary plus `ca-certificates` and `tzdata`.
+- `configs/config.yaml` is mounted read-only into the container at `/app/configs/config.yaml` — edit it on the host.
+- Database credentials and ports can be overridden with env vars (e.g. `POSTGRES_PASSWORD`, `MYSQL_PORT`). See `docker-compose.yml` for the full list.
+- Both profiles can coexist in the same `docker-compose.yml`; Compose only starts the profile you pick.
 
 ## Make Targets
 
@@ -127,10 +197,19 @@ Environment variables override YAML values. Prefix: `INDEXER_`.
 | `make indexer` | Run the indexer |
 | `make build` | Build binaries to `bin/` |
 | `make dbgen` | Generate GORM models and queries |
-| `make migrate-up` | Run database migrations (requires [goose](https://github.com/pressly/goose)) |
-| `make migrate-down` | Rollback last migration |
-| `make migrate-status` | Show migration status |
-| `make test` | Run tests |
+| `make migrate-up` | Run PostgreSQL migrations (requires [goose](https://github.com/pressly/goose)) |
+| `make migrate-down` | Rollback last PostgreSQL migration |
+| `make migrate-status` | Show PostgreSQL migration status |
+| `make migrate-mysql-up` | Run MySQL migrations |
+| `make migrate-mysql-down` | Rollback last MySQL migration |
+| `make migrate-mysql-status` | Show MySQL migration status |
+| `make test` | Run unit tests |
+| `make test-integration` | Run integration tests (requires Docker) |
+| `make docker-build` | Build the indexer image (`evm-indexer:latest`) |
+| `make docker-up-postgres` | Start the indexer + PostgreSQL stack |
+| `make docker-up-mysql` | Start the indexer + MySQL stack |
+| `make docker-down` | Stop and remove both compose profiles |
+| `make docker-logs` | Tail indexer container logs |
 | `make clean` | Remove build artifacts |
 
 ## Design Decisions
@@ -139,4 +218,5 @@ Environment variables override YAML values. Prefix: `INDEXER_`.
 - **Reorg strategy**: relies on `delay_block` to avoid short-lived reorgs. No block hash verification. If your business is reorg-sensitive, add your own checks.
 - **Per-handler cursors**: each handler tracks its own progress independently via the `scan_cursor` table.
 - **Fail fast**: empty filters, missing config fields, and invalid chain IDs are rejected at startup.
-- **Config validation**: `postgres.NewDB()` applies defaults then validates; `indexer.New()` validates config and handler filters before connecting to RPC.
+- **Database agnostic**: supports PostgreSQL and MySQL via GORM. The cursor store (`GormCursorStore`) works with any GORM-compatible backend. Switch by setting `databases.driver` in config.
+- **Config validation**: `postgres.NewDB()` / `mysql.NewDB()` applies defaults then validates; `indexer.New()` validates config and handler filters before connecting to RPC.

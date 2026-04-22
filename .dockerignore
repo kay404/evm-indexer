@@ -1,0 +1,30 @@
+# Build output
+bin/
+dist/
+
+# VCS
+.git/
+.gitignore
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local configs & env (never ship secrets into the image)
+configs/config.yaml
+configs/config.*.yaml
+!configs/config.example.yaml
+.env
+.env.*
+
+# Test artifacts and integration module (built separately)
+tests/
+
+# Docker compose state
+docker-compose.override.yml
+
+# Misc
+*.log
+coverage.out
+*.out

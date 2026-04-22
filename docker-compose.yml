@@ -1,0 +1,75 @@
+# Profiles let you pick one database stack:
+#   docker compose --profile postgres up -d
+#   docker compose --profile mysql    up -d
+#
+# The indexer service belongs to both profiles — it starts with whichever
+# profile you choose and reads connection details from ./configs/config.yaml
+# (mount path /app/configs/config.yaml).
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-indexer}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-indexer}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mysql:
+    image: mysql:8.0
+    profiles: ["mysql"]
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-indexer}
+      MYSQL_USER: ${MYSQL_USER:-indexer}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-indexer}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: evm-indexer:latest
+    profiles: ["postgres", "mysql"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+      mysql:
+        condition: service_healthy
+        required: false
+    volumes:
+      - ./configs/config.yaml:/app/configs/config.yaml:ro
+    # Override defaults via env vars if you prefer not to edit config.yaml.
+    # environment:
+    #   INDEXER_RPC_URL: https://bsc-dataseed.binance.org
+    #   INDEXER_CHAIN_ID: "56"
+    #   INDEXER_DB_DRIVER: postgres
+    #   INDEXER_POSTGRES_HOST: postgres
+    #   INDEXER_POSTGRES_PASSWORD: postgres
+    command: ["-config=/app/configs/config.yaml"]
+
+volumes:
+  postgres-data:
+  mysql-data:

@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
+)
+
+const (
+	rpcMaxRetries     = 3
+	rpcInitialBackoff = time.Second
+	minBatchBlocks    = uint64(1)
 )
 
 // Engine is the core event indexer that polls on-chain logs and dispatches them to handlers.
@@ -25,6 +32,9 @@ type Engine struct {
 
 // New creates a new indexer engine. At least one EventHandler must be provided.
 func New(cfg Config, cursor CursorStore, logger *slog.Logger, handlers ...EventHandler) (*Engine, error) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	if len(handlers) == 0 {
 		return nil, fmt.Errorf("at least one EventHandler is required")
 	}
@@ -149,30 +159,102 @@ func (e *Engine) processHandler(ctx context.Context, h EventHandler, safe uint64
 		return nil
 	}
 
+	batch := e.cfg.LogScanBatchBlocks
 	from := cursor + 1
 	for from <= safe {
-		to := from + e.cfg.LogScanBatchBlocks - 1
-		if to > safe {
-			to = safe
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		if err := e.scanAndHandle(ctx, h, from, to); err != nil {
+		to := min(from+batch-1, safe)
+
+		logs, err := e.scanWithRetry(ctx, h, from, to)
+		if err != nil {
+			if isResultTooLargeErr(err) {
+				if batch <= minBatchBlocks {
+					return fmt.Errorf("handle events [%s] %d-%d: result too large even at min batch: %w", name, from, to, err)
+				}
+				batch /= 2
+				if batch < minBatchBlocks {
+					batch = minBatchBlocks
+				}
+				e.logger.Warn("RPC returned too many results; shrinking batch",
+					"handler", name, "new_batch", batch)
+				continue
+			}
 			return fmt.Errorf("handle events [%s] %d-%d: %w", name, from, to, err)
+		}
+
+		if len(logs) > 0 {
+			e.logger.Info("events found",
+				"handler", name,
+				"from_block", from,
+				"to_block", to,
+				"count", len(logs),
+			)
+			if err := h.HandleLogs(ctx, logs); err != nil {
+				return fmt.Errorf("handle events [%s] %d-%d: handler: %w", name, from, to, err)
+			}
 		}
 
 		if err := e.cursor.UpsertCursor(ctx, name, to); err != nil {
 			return fmt.Errorf("update cursor [%s]: %w", name, err)
 		}
 		from = to + 1
+
+		// Gradually restore batch toward the configured maximum after a shrink.
+		if batch < e.cfg.LogScanBatchBlocks {
+			batch *= 2
+			if batch > e.cfg.LogScanBatchBlocks {
+				batch = e.cfg.LogScanBatchBlocks
+			}
+		}
 	}
 
 	return nil
 }
 
-func (e *Engine) scanAndHandle(ctx context.Context, h EventHandler, from, to uint64) error {
+// scanWithRetry performs eth_getLogs with exponential backoff on transient RPC errors.
+// "Too many results" errors are NOT retried here — the caller shrinks the batch instead.
+func (e *Engine) scanWithRetry(ctx context.Context, h EventHandler, from, to uint64) ([]types.Log, error) {
+	backoff := rpcInitialBackoff
+	var lastErr error
+	for attempt := 0; attempt <= rpcMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		logs, err := e.scan(ctx, h, from, to)
+		if err == nil {
+			return logs, nil
+		}
+		if !isTransientErr(err) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == rpcMaxRetries {
+			break
+		}
+		e.logger.Warn("RPC call failed; retrying",
+			"handler", h.Name(),
+			"from", from,
+			"to", to,
+			"attempt", attempt+1,
+			"backoff", backoff,
+			"error", err,
+		)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return nil, fmt.Errorf("rpc failed after %d retries: %w", rpcMaxRetries, lastErr)
+}
+
+func (e *Engine) scan(ctx context.Context, h EventHandler, from, to uint64) ([]types.Log, error) {
 	filter := h.Filter()
 
-	// Build eth_getLogs params
 	addresses := make([]string, len(filter.Addresses))
 	for i, a := range filter.Addresses {
 		addresses[i] = a.Hex()
@@ -206,21 +288,46 @@ func (e *Engine) scanAndHandle(ctx context.Context, h EventHandler, from, to uin
 
 	var logs []types.Log
 	if err := e.rpcClient.CallContext(ctx, &logs, "eth_getLogs", arg); err != nil {
-		return fmt.Errorf("eth_getLogs: %w", err)
+		return nil, fmt.Errorf("eth_getLogs: %w", err)
 	}
+	return logs, nil
+}
 
-	if len(logs) == 0 {
-		return nil
+// isResultTooLargeErr matches common provider error messages indicating the response
+// would exceed the node's size limits. Callers should retry with a smaller block range.
+// Patterns are kept specific so they don't steal rate-limit errors (see isTransientErr).
+func isResultTooLargeErr(err error) bool {
+	if err == nil {
+		return false
 	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "too many results") ||
+		strings.Contains(msg, "response size") ||
+		strings.Contains(msg, "log response size") ||
+		strings.Contains(msg, "query returned more than") ||
+		strings.Contains(msg, "size exceeded") ||
+		strings.Contains(msg, "log limit exceeded") ||
+		strings.Contains(msg, "block range") ||
+		strings.Contains(msg, "query timeout")
+}
 
-	e.logger.Info("events found",
-		"handler", h.Name(),
-		"from_block", from,
-		"to_block", to,
-		"count", len(logs),
-	)
-
-	return h.HandleLogs(ctx, logs)
+// isTransientErr matches errors worth retrying with backoff (rate limits, timeouts,
+// connection blips). "Too many results" is a separate case handled by shrinking batches.
+func isTransientErr(err error) bool {
+	if err == nil || isResultTooLargeErr(err) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "temporarily unavailable") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 func computeSafeBlock(latest, delay uint64) (uint64, bool) {
