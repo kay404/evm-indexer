@@ -35,6 +35,18 @@ indexer:
   log_scan_batch_blocks: 500
   start_block: 0
 
+  # Reorg detection (optional). When true, the engine records the canonical hash
+  # of every advanced cursor block and re-verifies it on every cycle. On mismatch
+  # it rewinds by reorg_rewind_depth blocks and re-scans. Handlers MUST be
+  # idempotent either way — this just catches deep reorgs past delay_block.
+  verify_cursor_hash: false
+  reorg_rewind_depth: 10
+
+  # HTTP /healthz endpoint (optional). Empty disables.
+  # Returns 200 if the last successful cycle was within 3×poll_interval (min 10s),
+  # 503 otherwise. Wire Docker HEALTHCHECK here.
+  health_addr: ":8080"
+
 contracts:
   - name: "my-handler"
     address: "0x0000000000000000000000000000000000000001"

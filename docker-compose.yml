@@ -59,6 +59,8 @@ services:
       mysql:
         condition: service_healthy
         required: false
+    ports:
+      - "${INDEXER_HEALTH_PORT:-8080}:8080"
     volumes:
       - ./configs/config.yaml:/app/configs/config.yaml:ro
     # Override defaults via env vars if you prefer not to edit config.yaml.
@@ -68,6 +70,8 @@ services:
     #   INDEXER_DB_DRIVER: postgres
     #   INDEXER_POSTGRES_HOST: postgres
     #   INDEXER_POSTGRES_PASSWORD: postgres
+    #   INDEXER_HEALTH_ADDR: ":8080"
+    #   INDEXER_VERIFY_CURSOR_HASH: "true"
     command: ["-config=/app/configs/config.yaml"]
 
 volumes:

@@ -2,20 +2,26 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/rpc"
 )
 
 const (
 	rpcMaxRetries     = 3
 	rpcInitialBackoff = time.Second
+	rpcDialTimeout    = 10 * time.Second
 	minBatchBlocks    = uint64(1)
 )
 
@@ -23,11 +29,14 @@ const (
 type Engine struct {
 	cfg       Config
 	logger    *slog.Logger
-	rpcClient *rpc.Client
 	ethClient *ethclient.Client
 	cursor    CursorStore
 	handlers  []EventHandler
 	closers   []io.Closer
+
+	// lastCycleAt holds the UnixNano timestamp of the last successfully-completed
+	// indexer cycle. Used by the /healthz endpoint to decide liveness.
+	lastCycleAt atomic.Int64
 }
 
 // New creates a new indexer engine. At least one EventHandler must be provided.
@@ -59,16 +68,17 @@ func New(cfg Config, cursor CursorStore, logger *slog.Logger, handlers ...EventH
 	}
 	cfg = cfg.withDefaults()
 
-	rpcClient, err := rpc.Dial(cfg.RPCURL)
+	dialCtx, cancel := context.WithTimeout(context.Background(), rpcDialTimeout)
+	defer cancel()
+	ethClient, err := ethclient.DialContext(dialCtx, cfg.RPCURL)
 	if err != nil {
-		return nil, fmt.Errorf("dial rpc: %w", err)
+		return nil, fmt.Errorf("dial rpc %s (timeout %s): %w", cfg.RPCURL, rpcDialTimeout, err)
 	}
 
 	return &Engine{
 		cfg:       cfg,
 		logger:    logger,
-		rpcClient: rpcClient,
-		ethClient: ethclient.NewClient(rpcClient),
+		ethClient: ethClient,
 		cursor:    cursor,
 		handlers:  handlers,
 	}, nil
@@ -82,8 +92,8 @@ func (e *Engine) AddCloser(c io.Closer) {
 
 // Close releases RPC and all registered resources.
 func (e *Engine) Close() {
-	if e.rpcClient != nil {
-		e.rpcClient.Close()
+	if e.ethClient != nil {
+		e.ethClient.Close()
 	}
 	for _, c := range e.closers {
 		_ = c.Close()
@@ -91,12 +101,23 @@ func (e *Engine) Close() {
 }
 
 // Run starts the polling loop. Blocks until ctx is cancelled.
+// Also starts the /healthz HTTP server if cfg.HealthAddr is set.
 func (e *Engine) Run(ctx context.Context) error {
+	if e.cfg.HealthAddr != "" {
+		go e.serveHealth(ctx)
+	}
+
 	ticker := time.NewTicker(e.cfg.PollInterval)
 	defer ticker.Stop()
 
 	for {
-		if err := e.runCycle(ctx); err != nil {
+		err := e.runCycle(ctx)
+		switch {
+		case err == nil:
+			e.lastCycleAt.Store(time.Now().UnixNano())
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// Shutdown path — let the select below exit cleanly.
+		default:
 			e.logger.Error("indexer cycle failed", "error", err)
 		}
 
@@ -106,6 +127,47 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// serveHealth runs an HTTP server exposing /healthz for container healthchecks.
+// /healthz returns 200 if the last successful cycle completed within 3×PollInterval
+// (or 10s, whichever is larger), and 503 otherwise. Returns 503 before the first cycle.
+func (e *Engine) serveHealth(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", e.healthHandler)
+	srv := &http.Server{
+		Addr:              e.cfg.HealthAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	e.logger.Info("health server listening", "addr", e.cfg.HealthAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		e.logger.Error("health server", "error", err)
+	}
+}
+
+func (e *Engine) healthHandler(w http.ResponseWriter, _ *http.Request) {
+	threshold := max(e.cfg.PollInterval*3, 10*time.Second)
+	lastNano := e.lastCycleAt.Load()
+	if lastNano == 0 {
+		http.Error(w, "warming up: no successful cycle yet\n", http.StatusServiceUnavailable)
+		return
+	}
+	elapsed := time.Since(time.Unix(0, lastNano))
+	if elapsed > threshold {
+		http.Error(w, fmt.Sprintf("stale: %s since last successful cycle (threshold %s)\n", elapsed, threshold), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "ok: %s since last cycle\n", elapsed.Truncate(time.Millisecond))
 }
 
 func (e *Engine) runCycle(ctx context.Context) error {
@@ -136,7 +198,7 @@ func (e *Engine) runCycle(ctx context.Context) error {
 func (e *Engine) processHandler(ctx context.Context, h EventHandler, safe uint64) error {
 	name := h.Name()
 
-	cursor, exists, err := e.cursor.GetCursor(ctx, name)
+	cursor, cursorHash, exists, err := e.cursor.GetCursor(ctx, name)
 	if err != nil {
 		return fmt.Errorf("load cursor [%s]: %w", name, err)
 	}
@@ -150,8 +212,31 @@ func (e *Engine) processHandler(ctx context.Context, h EventHandler, safe uint64
 		} else {
 			cursor = safe
 		}
-		if err := e.cursor.UpsertCursor(ctx, name, cursor); err != nil {
+		if err := e.cursor.UpsertCursor(ctx, name, cursor, common.Hash{}); err != nil {
 			return fmt.Errorf("initialize cursor [%s]: %w", name, err)
+		}
+		cursorHash = common.Hash{}
+	}
+
+	// Reorg check: if enabled and we have a recorded hash, compare it against the chain.
+	if e.cfg.VerifyCursorHash && cursorHash != (common.Hash{}) && cursor > 0 {
+		actual, err := e.blockHashAt(ctx, cursor)
+		if err != nil {
+			return fmt.Errorf("reorg check [%s] block %d: %w", name, cursor, err)
+		}
+		if actual != cursorHash {
+			rewound := rewindCursor(cursor, e.cfg.ReorgRewindDepth)
+			e.logger.Warn("reorg detected; rewinding cursor",
+				"handler", name,
+				"block", cursor,
+				"expected_hash", cursorHash.Hex(),
+				"actual_hash", actual.Hex(),
+				"rewound_to", rewound,
+			)
+			if err := e.cursor.UpsertCursor(ctx, name, rewound, common.Hash{}); err != nil {
+				return fmt.Errorf("rewind cursor [%s]: %w", name, err)
+			}
+			cursor = rewound
 		}
 	}
 
@@ -197,7 +282,17 @@ func (e *Engine) processHandler(ctx context.Context, h EventHandler, safe uint64
 			}
 		}
 
-		if err := e.cursor.UpsertCursor(ctx, name, to); err != nil {
+		// Record the canonical hash of `to` when hash verification is on.
+		// Fetching is done AFTER handler success so a handler failure doesn't waste an RPC round-trip.
+		var nextHash common.Hash
+		if e.cfg.VerifyCursorHash {
+			nextHash, err = e.blockHashAt(ctx, to)
+			if err != nil {
+				return fmt.Errorf("record cursor hash [%s] block %d: %w", name, to, err)
+			}
+		}
+
+		if err := e.cursor.UpsertCursor(ctx, name, to, nextHash); err != nil {
 			return fmt.Errorf("update cursor [%s]: %w", name, err)
 		}
 		from = to + 1
@@ -214,83 +309,97 @@ func (e *Engine) processHandler(ctx context.Context, h EventHandler, safe uint64
 	return nil
 }
 
-// scanWithRetry performs eth_getLogs with exponential backoff on transient RPC errors.
-// "Too many results" errors are NOT retried here — the caller shrinks the batch instead.
-func (e *Engine) scanWithRetry(ctx context.Context, h EventHandler, from, to uint64) ([]types.Log, error) {
+// retryTransient runs fn with exponential backoff on transient RPC errors.
+// Non-transient errors are returned immediately so callers can classify them
+// (e.g. "too many results" triggers a batch shrink instead of a retry).
+func (e *Engine) retryTransient(ctx context.Context, op string, fn func() error) error {
 	backoff := rpcInitialBackoff
 	var lastErr error
 	for attempt := 0; attempt <= rpcMaxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
-		logs, err := e.scan(ctx, h, from, to)
+		err := fn()
 		if err == nil {
-			return logs, nil
+			return nil
 		}
 		if !isTransientErr(err) {
-			return nil, err
+			return err
 		}
 		lastErr = err
 		if attempt == rpcMaxRetries {
 			break
 		}
 		e.logger.Warn("RPC call failed; retrying",
-			"handler", h.Name(),
-			"from", from,
-			"to", to,
+			"op", op,
 			"attempt", attempt+1,
 			"backoff", backoff,
 			"error", err,
 		)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-time.After(backoff):
 		}
 		backoff *= 2
 	}
-	return nil, fmt.Errorf("rpc failed after %d retries: %w", rpcMaxRetries, lastErr)
+	return fmt.Errorf("rpc failed after %d retries: %w", rpcMaxRetries, lastErr)
+}
+
+// scanWithRetry performs eth_getLogs with exponential backoff on transient RPC errors.
+// "Too many results" errors are NOT retried here — the caller shrinks the batch instead.
+func (e *Engine) scanWithRetry(ctx context.Context, h EventHandler, from, to uint64) ([]types.Log, error) {
+	var logs []types.Log
+	op := fmt.Sprintf("eth_getLogs [%s] %d-%d", h.Name(), from, to)
+	err := e.retryTransient(ctx, op, func() error {
+		var scanErr error
+		logs, scanErr = e.scan(ctx, h, from, to)
+		return scanErr
+	})
+	return logs, err
 }
 
 func (e *Engine) scan(ctx context.Context, h EventHandler, from, to uint64) ([]types.Log, error) {
 	filter := h.Filter()
-
-	addresses := make([]string, len(filter.Addresses))
-	for i, a := range filter.Addresses {
-		addresses[i] = a.Hex()
-	}
-
-	var topics []any
-	for _, level := range filter.Topics {
-		if len(level) == 0 {
-			topics = append(topics, nil)
-		} else if len(level) == 1 {
-			topics = append(topics, level[0].Hex())
-		} else {
-			hexes := make([]string, len(level))
-			for i, t := range level {
-				hexes[i] = t.Hex()
-			}
-			topics = append(topics, hexes)
-		}
-	}
-
-	arg := map[string]any{
-		"fromBlock": fmt.Sprintf("0x%x", from),
-		"toBlock":   fmt.Sprintf("0x%x", to),
-	}
-	if len(addresses) > 0 {
-		arg["address"] = addresses
-	}
-	if len(topics) > 0 {
-		arg["topics"] = topics
-	}
-
-	var logs []types.Log
-	if err := e.rpcClient.CallContext(ctx, &logs, "eth_getLogs", arg); err != nil {
+	logs, err := e.ethClient.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(from),
+		ToBlock:   new(big.Int).SetUint64(to),
+		Addresses: filter.Addresses,
+		Topics:    filter.Topics,
+	})
+	if err != nil {
 		return nil, fmt.Errorf("eth_getLogs: %w", err)
 	}
 	return logs, nil
+}
+
+// blockHashAt returns the canonical hash for the given block number on the chain,
+// retrying transient RPC errors. Used by the reorg-detection path — callers only
+// invoke this when cfg.VerifyCursorHash is true.
+func (e *Engine) blockHashAt(ctx context.Context, block uint64) (common.Hash, error) {
+	var hash common.Hash
+	op := fmt.Sprintf("eth_getBlockByNumber block=%d", block)
+	err := e.retryTransient(ctx, op, func() error {
+		header, hErr := e.ethClient.HeaderByNumber(ctx, new(big.Int).SetUint64(block))
+		if hErr != nil {
+			return hErr
+		}
+		hash = header.Hash()
+		return nil
+	})
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("header at %d: %w", block, err)
+	}
+	return hash, nil
+}
+
+// rewindCursor returns the block to rewind to when a reorg is detected at `cursor`.
+// Kept as a pure function so it can be unit-tested without a live chain.
+func rewindCursor(cursor, depth uint64) uint64 {
+	if cursor > depth {
+		return cursor - depth
+	}
+	return 0
 }
 
 // isResultTooLargeErr matches common provider error messages indicating the response
@@ -303,7 +412,6 @@ func isResultTooLargeErr(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "too many results") ||
 		strings.Contains(msg, "response size") ||
-		strings.Contains(msg, "log response size") ||
 		strings.Contains(msg, "query returned more than") ||
 		strings.Contains(msg, "size exceeded") ||
 		strings.Contains(msg, "log limit exceeded") ||

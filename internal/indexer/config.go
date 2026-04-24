@@ -26,6 +26,22 @@ type Config struct {
 
 	// StartBlock is the block to start scanning from. 0 means start from current safe block.
 	StartBlock uint64 `yaml:"start_block"`
+
+	// VerifyCursorHash enables reorg detection. When true, the engine records the
+	// canonical hash of every advanced cursor block and re-verifies it against the
+	// chain on each cycle. On mismatch, the cursor is rewound by ReorgRewindDepth
+	// blocks and the range is re-scanned (handlers must be idempotent).
+	//
+	// Default: false (preserves the template's simple no-reorg-check behavior).
+	VerifyCursorHash bool `yaml:"verify_cursor_hash"`
+
+	// ReorgRewindDepth is how many blocks to rewind when a reorg is detected.
+	// Only used when VerifyCursorHash is true. Default: 10.
+	ReorgRewindDepth uint64 `yaml:"reorg_rewind_depth"`
+
+	// HealthAddr is the bind address for the /healthz endpoint (e.g. ":8080").
+	// Empty disables the health server.
+	HealthAddr string `yaml:"health_addr"`
 }
 
 // ApplyEnv overrides Config fields from environment variables.
@@ -38,6 +54,9 @@ func (c *Config) ApplyEnv(prefix string) {
 	config.SetUint64(&c.DelayBlock, p+"DELAY_BLOCK")
 	config.SetUint64(&c.LogScanBatchBlocks, p+"LOG_SCAN_BATCH_BLOCKS")
 	config.SetUint64(&c.StartBlock, p+"START_BLOCK")
+	config.SetBool(&c.VerifyCursorHash, p+"VERIFY_CURSOR_HASH")
+	config.SetUint64(&c.ReorgRewindDepth, p+"REORG_REWIND_DEPTH")
+	config.SetString(&c.HealthAddr, p+"HEALTH_ADDR")
 }
 
 // Validate checks that required indexer fields are set.
@@ -60,6 +79,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.LogScanBatchBlocks == 0 {
 		c.LogScanBatchBlocks = 500
+	}
+	if c.ReorgRewindDepth == 0 {
+		c.ReorgRewindDepth = 10
 	}
 	return c
 }

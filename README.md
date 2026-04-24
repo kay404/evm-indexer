@@ -127,6 +127,9 @@ Environment variables override YAML values. Prefix: `INDEXER_`.
 | `INDEXER_POLL_INTERVAL` | Poll interval (e.g. `3s`) |
 | `INDEXER_DELAY_BLOCK` | Safe block delay |
 | `INDEXER_START_BLOCK` | Block to start scanning from |
+| `INDEXER_VERIFY_CURSOR_HASH` | `true` to enable reorg detection |
+| `INDEXER_REORG_REWIND_DEPTH` | Blocks to rewind on detected reorg (default 10) |
+| `INDEXER_HEALTH_ADDR` | Bind addr for `/healthz` (e.g. `:8080`). Empty disables |
 
 **Database driver:**
 
@@ -215,7 +218,9 @@ Notes:
 ## Design Decisions
 
 - **At-least-once delivery**: handlers may receive the same logs on retry. Implement idempotency using unique constraints or deduplication by `(txHash, logIndex)`.
-- **Reorg strategy**: relies on `delay_block` to avoid short-lived reorgs. No block hash verification. If your business is reorg-sensitive, add your own checks.
+- **Reorg strategy**: by default the engine relies on `delay_block` to avoid short reorgs. Set `indexer.verify_cursor_hash: true` to opt into hash-based reorg detection: the engine records the canonical hash of every advanced cursor block and verifies it on each cycle. Mismatch triggers a rewind of `reorg_rewind_depth` blocks (default 10) and a re-scan. Handlers MUST be idempotent either way.
+- **RPC resilience**: transient errors (429, rate limit, timeout, EOF) retry with exponential backoff up to 3 times. "Too many results" responses halve the batch size automatically, then recover toward `log_scan_batch_blocks` on success.
+- **Health endpoint**: set `indexer.health_addr` to expose `GET /healthz`. Returns 200 if the last successful cycle completed within `3×poll_interval` (min 10s), 503 otherwise. Matches Docker's `HEALTHCHECK`.
 - **Per-handler cursors**: each handler tracks its own progress independently via the `scan_cursor` table.
 - **Fail fast**: empty filters, missing config fields, and invalid chain IDs are rejected at startup.
 - **Database agnostic**: supports PostgreSQL and MySQL via GORM. The cursor store (`GormCursorStore`) works with any GORM-compatible backend. Switch by setting `databases.driver` in config.

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -14,26 +17,31 @@ import (
 
 // --- in-memory CursorStore for testing ---
 
+type memoryCursorRecord struct {
+	block uint64
+	hash  common.Hash
+}
+
 type memoryCursorStore struct {
 	mu      sync.Mutex
-	cursors map[string]uint64
+	cursors map[string]memoryCursorRecord
 }
 
 func newMemoryCursorStore() *memoryCursorStore {
-	return &memoryCursorStore{cursors: make(map[string]uint64)}
+	return &memoryCursorStore{cursors: make(map[string]memoryCursorRecord)}
 }
 
-func (m *memoryCursorStore) GetCursor(_ context.Context, name string) (uint64, bool, error) {
+func (m *memoryCursorStore) GetCursor(_ context.Context, name string) (uint64, common.Hash, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.cursors[name]
-	return v, ok, nil
+	return v.block, v.hash, ok, nil
 }
 
-func (m *memoryCursorStore) UpsertCursor(_ context.Context, name string, block uint64) error {
+func (m *memoryCursorStore) UpsertCursor(_ context.Context, name string, block uint64, hash common.Hash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cursors[name] = block
+	m.cursors[name] = memoryCursorRecord{block: block, hash: hash}
 	return nil
 }
 
@@ -103,7 +111,7 @@ func TestProcessHandler_StartBlockInFuture(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, exists, _ := store.GetCursor(context.Background(), "test")
+	_, _, exists, _ := store.GetCursor(context.Background(), "test")
 	if exists {
 		t.Error("cursor should NOT exist when StartBlock > safe")
 	}
@@ -126,7 +134,7 @@ func TestProcessHandler_NoStartBlock(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	cursor, exists, _ := store.GetCursor(context.Background(), "test")
+	cursor, _, exists, _ := store.GetCursor(context.Background(), "test")
 	if !exists || cursor != 100 {
 		t.Errorf("cursor = %d, exists = %v, want 100, true", cursor, exists)
 	}
@@ -136,7 +144,7 @@ func TestProcessHandler_NoStartBlock(t *testing.T) {
 
 func TestProcessHandler_CursorAlreadyCaughtUp(t *testing.T) {
 	store := newMemoryCursorStore()
-	_ = store.UpsertCursor(context.Background(), "test", 100)
+	_ = store.UpsertCursor(context.Background(), "test", 100, common.Hash{})
 
 	e := &Engine{
 		cfg:    Config{StartBlock: 1, LogScanBatchBlocks: 500}.withDefaults(),
@@ -151,7 +159,7 @@ func TestProcessHandler_CursorAlreadyCaughtUp(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	cursor, _, _ := store.GetCursor(context.Background(), "test")
+	cursor, _, _, _ := store.GetCursor(context.Background(), "test")
 	if cursor != 100 {
 		t.Errorf("cursor = %d, want 100 (unchanged)", cursor)
 	}
@@ -174,8 +182,8 @@ func TestProcessHandler_IndependentCursors(t *testing.T) {
 	_ = e.processHandler(context.Background(), hA, 50)
 	_ = e.processHandler(context.Background(), hB, 50)
 
-	cursorA, existsA, _ := store.GetCursor(context.Background(), "handler-a")
-	cursorB, existsB, _ := store.GetCursor(context.Background(), "handler-b")
+	cursorA, _, existsA, _ := store.GetCursor(context.Background(), "handler-a")
+	cursorB, _, existsB, _ := store.GetCursor(context.Background(), "handler-b")
 
 	if !existsA || cursorA != 50 {
 		t.Errorf("handler-a cursor = %d, exists = %v, want 50, true", cursorA, existsA)
@@ -185,10 +193,10 @@ func TestProcessHandler_IndependentCursors(t *testing.T) {
 	}
 
 	// Advance handler-a manually, handler-b stays
-	_ = store.UpsertCursor(context.Background(), "handler-a", 100)
+	_ = store.UpsertCursor(context.Background(), "handler-a", 100, common.Hash{})
 
-	cursorA, _, _ = store.GetCursor(context.Background(), "handler-a")
-	cursorB, _, _ = store.GetCursor(context.Background(), "handler-b")
+	cursorA, _, _, _ = store.GetCursor(context.Background(), "handler-a")
+	cursorB, _, _, _ = store.GetCursor(context.Background(), "handler-b")
 
 	if cursorA != 100 {
 		t.Errorf("handler-a cursor = %d, want 100", cursorA)
@@ -348,7 +356,7 @@ func TestMemoryCursorStore_ReadWrite(t *testing.T) {
 	store := newMemoryCursorStore()
 	ctx := context.Background()
 
-	_, exists, err := store.GetCursor(ctx, "test")
+	_, _, exists, err := store.GetCursor(ctx, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,11 +364,11 @@ func TestMemoryCursorStore_ReadWrite(t *testing.T) {
 		t.Error("expected cursor not to exist initially")
 	}
 
-	if err := store.UpsertCursor(ctx, "test", 42); err != nil {
+	if err := store.UpsertCursor(ctx, "test", 42, common.Hash{}); err != nil {
 		t.Fatal(err)
 	}
 
-	block, exists, err := store.GetCursor(ctx, "test")
+	block, _, exists, err := store.GetCursor(ctx, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,16 +376,88 @@ func TestMemoryCursorStore_ReadWrite(t *testing.T) {
 		t.Errorf("got block=%d exists=%v, want 42/true", block, exists)
 	}
 
-	if err := store.UpsertCursor(ctx, "test", 100); err != nil {
+	// Round-trip a non-zero hash.
+	sampleHash := common.HexToHash("0xdeadbeefcafe1234567890abcdef1234567890abcdef1234567890abcdef1234")
+	if err := store.UpsertCursor(ctx, "test", 100, sampleHash); err != nil {
 		t.Fatal(err)
 	}
-	block, _, _ = store.GetCursor(ctx, "test")
+	block, gotHash, _, _ := store.GetCursor(ctx, "test")
 	if block != 100 {
 		t.Errorf("got block=%d, want 100", block)
 	}
+	if gotHash != sampleHash {
+		t.Errorf("got hash=%s, want %s", gotHash.Hex(), sampleHash.Hex())
+	}
 
-	_, exists, _ = store.GetCursor(ctx, "other")
+	_, _, exists, _ = store.GetCursor(ctx, "other")
 	if exists {
 		t.Error("different name should not exist")
+	}
+}
+
+// --- healthHandler tests ---
+
+func TestHealthHandler_WarmingUp(t *testing.T) {
+	e := &Engine{
+		cfg:    Config{PollInterval: 3 * time.Second}.withDefaults(),
+		logger: testLogger(),
+	}
+	// Never called Run — lastCycleAt is zero.
+	rec := httptest.NewRecorder()
+	e.healthHandler(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("code = %d, want 503 before first cycle", rec.Code)
+	}
+}
+
+func TestHealthHandler_Healthy(t *testing.T) {
+	e := &Engine{
+		cfg:    Config{PollInterval: 3 * time.Second}.withDefaults(),
+		logger: testLogger(),
+	}
+	e.lastCycleAt.Store(time.Now().UnixNano())
+	rec := httptest.NewRecorder()
+	e.healthHandler(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200 immediately after cycle", rec.Code)
+	}
+}
+
+func TestHealthHandler_Stale(t *testing.T) {
+	e := &Engine{
+		cfg:    Config{PollInterval: 3 * time.Second}.withDefaults(),
+		logger: testLogger(),
+	}
+	// Pretend the last cycle was 5 minutes ago — far past the threshold.
+	e.lastCycleAt.Store(time.Now().Add(-5 * time.Minute).UnixNano())
+	rec := httptest.NewRecorder()
+	e.healthHandler(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("code = %d, want 503 when stale", rec.Code)
+	}
+}
+
+// --- rewindCursor tests ---
+
+func TestRewindCursor(t *testing.T) {
+	tests := []struct {
+		name          string
+		cursor, depth uint64
+		want          uint64
+	}{
+		{"normal rewind", 100, 10, 90},
+		{"depth equal to cursor rewinds to 0", 10, 10, 0},
+		{"depth greater than cursor clamps at 0", 5, 10, 0},
+		{"cursor 0 stays 0", 0, 10, 0},
+		{"depth 0 stays at cursor", 50, 0, 50},
+		{"one block above depth", 11, 10, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewindCursor(tt.cursor, tt.depth)
+			if got != tt.want {
+				t.Errorf("rewindCursor(%d, %d) = %d, want %d", tt.cursor, tt.depth, got, tt.want)
+			}
+		})
 	}
 }

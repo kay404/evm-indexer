@@ -3,6 +3,7 @@ module github.com/kay404/evm-indexer/tests/integration
 go 1.25.0
 
 require (
+	github.com/ethereum/go-ethereum v1.15.11
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/kay404/evm-indexer v0.0.0
 	github.com/pressly/goose/v3 v3.27.0
@@ -38,7 +39,6 @@ require (
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.0 // indirect
-	github.com/ethereum/go-ethereum v1.15.11 // indirect
 	github.com/ethereum/go-verkle v0.2.2 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-faster/city v1.0.1 // indirect

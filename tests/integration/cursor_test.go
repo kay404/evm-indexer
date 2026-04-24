@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
@@ -84,7 +85,7 @@ func TestGormCursorStore_MySQL_GetCursor_NotExists(t *testing.T) {
 	store := setupCursorStore(t)
 	ctx := context.Background()
 
-	block, exists, err := store.GetCursor(ctx, "nonexistent")
+	block, hash, exists, err := store.GetCursor(ctx, "nonexistent")
 	if err != nil {
 		t.Fatalf("GetCursor: %v", err)
 	}
@@ -94,17 +95,20 @@ func TestGormCursorStore_MySQL_GetCursor_NotExists(t *testing.T) {
 	if block != 0 {
 		t.Errorf("block = %d, want 0", block)
 	}
+	if hash != (common.Hash{}) {
+		t.Errorf("hash = %s, want zero", hash.Hex())
+	}
 }
 
 func TestGormCursorStore_MySQL_UpsertAndGet(t *testing.T) {
 	store := setupCursorStore(t)
 	ctx := context.Background()
 
-	// Insert.
-	if err := store.UpsertCursor(ctx, "handler-a", 100); err != nil {
+	// Insert without hash.
+	if err := store.UpsertCursor(ctx, "handler-a", 100, common.Hash{}); err != nil {
 		t.Fatalf("UpsertCursor (insert): %v", err)
 	}
-	block, exists, err := store.GetCursor(ctx, "handler-a")
+	block, hash, exists, err := store.GetCursor(ctx, "handler-a")
 	if err != nil {
 		t.Fatalf("GetCursor: %v", err)
 	}
@@ -114,17 +118,33 @@ func TestGormCursorStore_MySQL_UpsertAndGet(t *testing.T) {
 	if block != 100 {
 		t.Errorf("block = %d, want 100", block)
 	}
+	if hash != (common.Hash{}) {
+		t.Errorf("hash = %s, want zero after insert without hash", hash.Hex())
+	}
 
-	// Update (upsert same name).
-	if err := store.UpsertCursor(ctx, "handler-a", 200); err != nil {
+	// Update with a non-zero hash and verify round-trip.
+	wantHash := common.HexToHash("0xabc1230000000000000000000000000000000000000000000000000000000def")
+	if err := store.UpsertCursor(ctx, "handler-a", 200, wantHash); err != nil {
 		t.Fatalf("UpsertCursor (update): %v", err)
 	}
-	block, _, err = store.GetCursor(ctx, "handler-a")
+	block, hash, _, err = store.GetCursor(ctx, "handler-a")
 	if err != nil {
 		t.Fatalf("GetCursor: %v", err)
 	}
 	if block != 200 {
 		t.Errorf("block = %d, want 200", block)
+	}
+	if hash != wantHash {
+		t.Errorf("hash = %s, want %s", hash.Hex(), wantHash.Hex())
+	}
+
+	// Upsert back to zero hash clears the stored value.
+	if err := store.UpsertCursor(ctx, "handler-a", 300, common.Hash{}); err != nil {
+		t.Fatalf("UpsertCursor (clear hash): %v", err)
+	}
+	_, hash, _, _ = store.GetCursor(ctx, "handler-a")
+	if hash != (common.Hash{}) {
+		t.Errorf("hash = %s, want zero after clear", hash.Hex())
 	}
 }
 
@@ -132,15 +152,15 @@ func TestGormCursorStore_MySQL_IndependentCursors(t *testing.T) {
 	store := setupCursorStore(t)
 	ctx := context.Background()
 
-	if err := store.UpsertCursor(ctx, "handler-x", 10); err != nil {
+	if err := store.UpsertCursor(ctx, "handler-x", 10, common.Hash{}); err != nil {
 		t.Fatalf("UpsertCursor x: %v", err)
 	}
-	if err := store.UpsertCursor(ctx, "handler-y", 20); err != nil {
+	if err := store.UpsertCursor(ctx, "handler-y", 20, common.Hash{}); err != nil {
 		t.Fatalf("UpsertCursor y: %v", err)
 	}
 
-	bx, _, _ := store.GetCursor(ctx, "handler-x")
-	by, _, _ := store.GetCursor(ctx, "handler-y")
+	bx, _, _, _ := store.GetCursor(ctx, "handler-x")
+	by, _, _, _ := store.GetCursor(ctx, "handler-y")
 
 	if bx != 10 {
 		t.Errorf("handler-x block = %d, want 10", bx)

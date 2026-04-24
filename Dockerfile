@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # -------- runtime stage --------
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata wget \
  && addgroup -S indexer \
  && adduser -S -G indexer indexer
 
@@ -38,6 +38,11 @@ COPY --from=builder /out/indexer /app/indexer
 COPY configs/config.example.yaml /app/configs/config.example.yaml
 
 USER indexer
+
+# Default /healthz port — align with configs/config.yaml's health_addr.
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
+    CMD wget -q --spider http://127.0.0.1:8080/healthz || exit 1
 
 ENTRYPOINT ["/app/indexer"]
 CMD ["-config=/app/configs/config.yaml"]
